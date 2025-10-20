@@ -7,82 +7,117 @@ on:
   release:
     types: [published]
 
+env:
+  node_version: 20
+
 jobs:
   build:
-    permissions:
-      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      # Get part of the tag after the `v`.
-      - name: Extract tag version number
-        id: get_version
-        uses: battila7/get-version-action@v2
-
-      # Substitute the Manifest and Download URLs in the module.json
-      # for a FULL RELEASE
-      # Remove HotReload and update version and download properties.
-      - name: Modify Manifest to remove HotReload
-        if: '!github.event.release.prerelease'
-        id: sub_release_manifest_version
-        uses: microsoft/variable-substitution@v1
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          files: "module.json"
-        env:
-          flags.hotReload: false
-          version: ${{steps.get_version.outputs.version-without-v}}
-          url: https://github.com/${{github.repository}}
-          manifest: https://github.com/${{github.repository}}/releases/latest/download/module.json
-          download: https://github.com/${{github.repository}}/releases/download/${{github.event.release.tag_name}}/module.zip
+          node-version: ${{ env.node_version }}
 
-      # Substitute the Manifest and Download URLs in the module.json
-      # for a PRE RELEASE.
-      - name: Substitute Manifest and Download Links For Versioned Ones
-        if: 'github.event.release.prerelease'
-        id: sub_prerelease_manifest_version
-        uses: microsoft/variable-substitution@v1
-        with:
-          files: "module.json"
-        env:
-          flags.hotReload: false
-          version: ${{steps.get_version.outputs.version-without-v}}
-          url: https://github.com/${{github.repository}}
-          manifest: https://github.com/${{github.repository}}/releases/latest/download/module.json
-          download: https://github.com/${{github.repository}}/releases/download/${{github.event.release.tag_name}}/module.zip
+      - name: Install dependencies (if present)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          fi
 
+      - name: Prepare dist folder
+        run: |
+          rm -rf dist
+          mkdir dist
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='dist' \
+            --exclude='dist-latest' \
+            --exclude='node_modules' \
+            --exclude='module.zip' \
+            ./ ./dist/
 
-      # Create zip file.
-      - name: Create ZIP archive
-        run: zip -r ./module.zip module.json lang/ scripts/
+      - name: Gather release metadata
+        id: release
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          REPO="${{ github.repository }}"
+          MANIFEST_URL="https://github.com/${REPO}/releases/download/${TAG}/module.json"
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/module.zip"
+          LATEST_MANIFEST_URL="https://github.com/${REPO}/releases/download/latest/module.json"
+          LATEST_DOWNLOAD_URL="https://github.com/${REPO}/releases/download/latest/module.zip"
 
-      # Create a release for this specific version.
-      - name: Update Release with Files
-        if: '!github.event.release.prerelease'
-        id: create_version_release
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "manifest_url=$MANIFEST_URL" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "latest_manifest_url=$LATEST_MANIFEST_URL" >> "$GITHUB_OUTPUT"
+          echo "latest_download_url=$LATEST_DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update release manifest
+        run: |
+          jq \
+            --arg version "${{ steps.release.outputs.version }}" \
+            --arg manifest "${{ steps.release.outputs.manifest_url }}" \
+            --arg download "${{ steps.release.outputs.download_url }}" \
+            --arg repo "https://github.com/${{ github.repository }}" \
+            '(.flags.hotReload = false) | .version = $version | .url = $repo | .manifest = $manifest | .download = $download' \
+            dist/module.json > dist/module.json.tmp && mv dist/module.json.tmp dist/module.json
+
+      - name: Create release archive
+        working-directory: dist
+        run: zip -r ../module.zip ./*
+
+      - name: Update GitHub release
+        id: update-release
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
+          tag: ${{ steps.release.outputs.tag }}
           name: ${{ github.event.release.name }}
+          artifacts: "./module.zip, ./dist/module.json"
+          draft: false
+          prerelease: ${{ github.event.release.prerelease }}
+          generateReleaseNotes: false
+          body: ${{ github.event.release.body }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare latest artifact
+        if: ${{ !github.event.release.prerelease }}
+        run: |
+          rm -rf dist-latest
+          mkdir dist-latest
+          rsync -av dist/ dist-latest/
+          jq \
+            --arg version "${{ steps.release.outputs.version }}" \
+            --arg manifest "${{ steps.release.outputs.latest_manifest_url }}" \
+            --arg download "${{ steps.release.outputs.latest_download_url }}" \
+            --arg repo "https://github.com/${{ github.repository }}" \
+            '(.flags.hotReload = false) | .version = $version | .url = $repo | .manifest = $manifest | .download = $download' \
+            dist-latest/module.json > dist-latest/module.json.tmp && mv dist-latest/module.json.tmp dist-latest/module.json
+
+      - name: Zip latest artifact
+        if: ${{ !github.event.release.prerelease }}
+        working-directory: dist-latest
+        run: zip -r ../module.zip ./*
+
+      - name: Update latest GitHub release
+        if: ${{ !github.event.release.prerelease }}
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: latest
+          name: Latest Release
+          artifacts: "./module.zip, ./dist-latest/module.json"
           draft: false
           prerelease: false
+          generateReleaseNotes: false
+          body: "Latest stable release for version ${{ steps.release.outputs.version }}."
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "./module.json, ./module.zip"
-          tag: ${{ github.event.release.tag_name }}
-          body: ${{ github.event.release.body }}
-
-      # Create a release for this specific version.
-      - name: Update Pre-release with Files
-        if: 'github.event.release.prerelease'
-        id: create_version_prerelease
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          name: ${{ github.event.release.name }}
-          draft: false
-          prerelease: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: "./module.json, ./module.zip"
-          tag: ${{ github.event.release.tag_name }}
-          body: ${{ github.event.release.body }}
